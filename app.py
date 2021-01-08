@@ -142,28 +142,11 @@ async def feed(request: Request) -> Response:
         # need to know how many pages WordPress is going to break this feed
         # into so we can link to the last of them.
         url = update_query(url, order="ASC")
-        exists = partial(page_exists, url, raw_content_type)
+        last_page = await exponential_search(
+            partial(page_exists, url, raw_content_type)
+        )
 
-        page = 2
-        while await exists(page):
-            page *= 2
-
-            # There's no guarantee that the server is actually honoring the
-            # pagination query parameters, but we don't have a good way to
-            # check that using only HEAD requests. Instead, impose an absurdly
-            # high limit on how many archive pages we're willing to process.
-            if page >= 65536:
-                raise HTTPException(403, "Too much archives")
-
-        # We now know that at least `page/2` pages exist but there are fewer
-        # than `page`, so now we need to check all the page numbers in between.
-        # Note that we're guaranteed that at least one page exists, because we
-        # fetched it already. If `page` is still 2, then there is only that one
-        # page, but we'll try to binary search the empty range 2..1, which will
-        # immediately return 1.
-        page = await binary_search(page // 2 + 1, page - 1, exists)
-
-        if page == 1:
+        if last_page == 1:
             # This is a complete feed, no pagination needed.
             new_elements.append(element("fh", "complete"))
         else:
@@ -171,7 +154,7 @@ async def feed(request: Request) -> Response:
             # possibly a few extra if the number of posts per page doesn't
             # evenly divide into the total number of posts. Either way we
             # should link to the page before the final one.
-            prev_url = await hash_page(url, raw_content_type, page - 1)
+            prev_url = await hash_page(url, raw_content_type, last_page - 1)
             new_elements.append(
                 element(
                     "atom",
@@ -218,6 +201,23 @@ async def hash_page(url: httpx.URL, content_type: str, page: int) -> httpx.URL:
 
 
 async def page_exists(url: httpx.URL, content_type: str, page: int) -> bool:
+    """
+    Tests whether the given URL exists and has the given Content-Type, if we
+    request the specified page number out of its paginated sequence.
+    """
+
+    # There's no guarantee that the server is actually honoring the
+    # pagination query parameters, but we don't have a good way to
+    # check that using only HEAD requests. Instead, impose an absurdly
+    # high limit on how many archive pages we're willing to process.
+    if page >= 65536:
+        raise HTTPException(403, "Too much archives")
+
+    # We're guaranteed that at least one page exists, because we fetched a page
+    # with some (possibly zero) number of entries on it already.
+    if page == 1:
+        return True
+
     url = update_query(url, paged=str(page))
     response = await http_client.head(url, allow_redirects=False)
     if response.status_code == 404:
@@ -233,20 +233,70 @@ async def page_exists(url: httpx.URL, content_type: str, page: int) -> bool:
 
 
 def update_query(url: httpx.URL, **new_params: Optional[str]) -> httpx.URL:
-    # Put the URL into a canonical form to increase cache hit rates. A generic
-    # client can't make any assumptions about how the query string is used, but
-    # because we only care how WordPress would interpret it, we can safely
-    # de-duplicate and sort the parameters.
-    params = {k: v for k, v in parse_qsl(url.query) if k.decode() not in new_params}
-    params.update(
-        (k.encode(), v.encode()) for k, v in new_params.items() if v is not None
-    )
+    """
+    Adds, replaces, or removes query parameters. For each keyword argument, all
+    query parameters with that name are removed; then, if the argument is not
+    None, it's added as the sole new value of the corresponding query
+    parameter.
+
+    >>> str(update_query(httpx.URL("http://example.org/"), yes="1", no=None))
+    'http://example.org/?yes=1'
+    >>> str(update_query(httpx.URL("http://example.org/?yes=0&no="), yes="1", no=None))
+    'http://example.org/?yes=1'
+
+    Additionally, this function puts the URL into a canonical form to increase
+    cache hit rates. A generic client can't make any assumptions about how the
+    query string is used, but because we only care how WordPress would
+    interpret it, we can safely de-duplicate and sort the parameters.
+
+    >>> str(update_query(httpx.URL("http://example.org/?yes=2&yes=1&no=0")))
+    'http://example.org/?no=0&yes=1'
+    """
+
+    params = dict(parse_qsl(url.query))
+    for k, v in new_params.items():
+        if v is None:
+            params.pop(k.encode(), None)
+        else:
+            params[k.encode()] = v.encode()
     query = urlencode(sorted(params.items())).encode()
     return url.copy_with(query=query)
 
 
 def element(prefix: str, name: str, **kwargs: str) -> ElementTree.Element:
     return ElementTree.Element("{" + NAMESPACES[prefix] + "}" + name, attrib=kwargs)
+
+
+async def exponential_search(pred: Callable[[int], Awaitable[bool]]) -> int:
+    """
+    Finds the length of a sequence, given that the only question you can ask
+    is, "is this sequence at least N elements long?" and you don't have a
+    reasonable upper bound on the length of the sequence.
+
+    >>> from asyncio import run
+    >>> async def pred(i):
+    ...     return i <= limit
+
+    >>> limit = 0
+    >>> run(exponential_search(pred))
+    0
+    >>> limit = 1
+    >>> run(exponential_search(pred))
+    1
+    >>> limit = 100000
+    >>> run(exponential_search(pred))
+    100000
+    """
+
+    length = 1
+    while await pred(length):
+        length *= 2
+
+    # We now know that at least `length/2` items exist but there are fewer than
+    # `length`, so now we need to check all the lengths in between. If `length`
+    # is 1 or 2, this means searching the empty ranges 1..0 or 2..1
+    # respectively, and binary_search correctly reports 0 or 1 in those cases.
+    return await binary_search(length // 2 + 1, length - 1, pred)
 
 
 async def binary_search(
