@@ -263,10 +263,13 @@ async def binary_search(
     >>> run(binary_search(1, 10, pred))
     7
 
-    If the range is empty, then this function returns hi.
+    If the range is empty or the predicate is True for every index in the
+    range, then this function returns hi.
 
     >>> run(binary_search(11, 10, pred))
     10
+    >>> run(binary_search(1, 5, pred))
+    5
 
     If the predicate is not True for any index in the range, then this function
     returns lo-1.
@@ -275,12 +278,20 @@ async def binary_search(
     9
     """
 
+    # postcondition: returns n
+    # precondition: forall i, pred(i) iff i <= n
+    # precondition: lo - 1 <= n <= hi
+    # loop invariant: pred(lo - 1) and !pred(hi + 1)
     while lo <= hi:
+        # Python has arbitrary-precision ints so we don't have to worry about
+        # overflow, but let's not pay the cost for them if we don't need it.
         mid = lo + (hi - lo) // 2
         if await pred(mid):
             lo = mid + 1
         else:
             hi = mid - 1
+    # Since initially lo - 1 <= hi, now hi == lo - 1. By the loop invariant
+    # then, pred(hi) is True and pred(hi + 1) is False.
     return hi
 
 
