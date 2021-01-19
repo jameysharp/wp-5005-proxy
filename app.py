@@ -8,7 +8,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import Response
 from starlette.requests import Request
 from starlette.routing import Route
-from typing import Awaitable, Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Iterable, Optional, TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode
 from xml.etree import ElementTree
 
@@ -43,51 +43,117 @@ HISTORY_TAGS = (
     "./fh:archive",
 )
 
+# If the contents of an archive page change, we'll signal that by changing its
+# URL, not its cache validators. So a hard-coded ETag is fine.
+ARCHIVE_ETAG = '"wp-rfc5005-archive"'
+
+# We remove these headers before forwarding the client's headers to the server
+# or vice-versa. See remove_connection_headers below.
+CONNECTION_HEADERS = frozenset(
+    (
+        "connection",
+        # from https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Connection:
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        # these could confuse us:
+        "accept-encoding",
+        "accept-ranges",
+        "expect",
+        "if-range",
+        "range",
+    )
+)
+
 config = Config(".env")
 
 DEBUG = config("DEBUG", cast=bool, default=False)
 HTTP_PROXY = config("HTTP_PROXY", default=None)
 
+# Use forward-only mode so the proxy can see and cache even HTTPS requests.
+# https://www.python-httpx.org/advanced/#proxy-mechanisms
 http_client = httpx.AsyncClient(
-    headers={"User-Agent": "jamey@minilop.net"},
-    # use forward-only mode so the proxy can see and cache even HTTPS requests
-    # https://www.python-httpx.org/advanced/#proxy-mechanisms
-    proxies=httpx.Proxy(url=HTTP_PROXY, mode="FORWARD_ONLY") if HTTP_PROXY else {},
+    proxies=httpx.Proxy(url=HTTP_PROXY, mode="FORWARD_ONLY") if HTTP_PROXY else {}
 )
 
 
 async def feed(request: Request) -> Response:
+    # If this client has requested this page from us before and we gave them
+    # our special ETag for an archive page, then we can immediately conclude
+    # that whatever response we gave them before is fine.
+    if any(
+        ARCHIVE_ETAG in get_list(v) for v in request.headers.getlist("If-None-Match")
+    ):
+        # XXX: https://tools.ietf.org/html/rfc7232#section-4.1 says "The server
+        # generating a 304 response MUST generate any of the following header
+        # fields that would have been sent in a 200 (OK) response to the same
+        # request: Cache-Control, Content-Location, Date, ETag, Expires, and
+        # Vary," but we don't have most of those available without forwarding
+        # the request upstream. We're acting sort of like a cache but because
+        # we're stateless we don't have a stored response to use to satisfy
+        # this requirement. However we can at least tell the client which of
+        # the ETags it asked about is the right one.
+        return Response(status_code=304, headers={"ETag": ARCHIVE_ETAG})
+
     # Allow clients to either URL-encode query parameters in the path or append
     # them unquoted.
     url = httpx.URL(request.path_params["url"], request.query_params)
+
+    expected_hash = next((v for k, v in parse_qsl(url.query) if k == b"modified"), None)
 
     # No matter what, make sure the feed is sorted by modification time. Even
     # the current feed must change whenever any post is modified.
     url = update_query(url, modified=None, orderby="modified")
 
-    async with http_client.stream("GET", url) as doc:
+    # WordPress sets ETag and Last-Modified based on the timestamp of the most
+    # recently modified post anywhere on the site, and has done so unchanged
+    # since at least 2010. This means that our transformed feed won't have
+    # changed if the upstream validators haven't changed. So we can safely
+    # forward cache validation headers between the client and server.
+
+    request_headers = httpx.Headers(request.headers.items())
+    remove_connection_headers(request_headers)
+
+    async with http_client.stream("GET", url, headers=request_headers) as doc:
+        response_headers = doc.headers
+        remove_connection_headers(response_headers)
+
+        assert doc.url is not None
+        url = doc.url
+        if "content-location" not in response_headers:
+            response_headers["content-location"] = str(url)
+
         if doc.status_code != 200:
-            raise HTTPException(doc.status_code if doc.status_code >= 400 else 502)
+            return Response(
+                status_code=doc.status_code, headers=dict(response_headers.items())
+            )
 
         if "https://api.w.org/" not in doc.links:
             raise HTTPException(403, "Not a WordPress site")
 
         try:
-            raw_content_type = doc.headers["Content-Type"]
+            raw_content_type = response_headers["content-type"]
             content_type = raw_content_type.split(";", 1)[0].strip()
         except KeyError:
             raise HTTPException(502, "Origin didn't provide a Content-Type")
 
-        assert doc.url is not None
-        url = doc.url
-
         try:
+            contents_hash = sha256()
             parser = XMLParser()
             async for chunk in doc.aiter_bytes():
+                contents_hash.update(chunk)
                 parser.feed(chunk)
             root = parser.close()
         except ElementTree.ParseError:
             raise HTTPException(406, "Unsupported non-XML feed format")
+
+    actual_hash = urlsafe_b64encode(contents_hash.digest())
+    if expected_hash is not None and expected_hash != actual_hash:
+        raise HTTPException(410, "Page contents changed")
 
     feed_element = None
     if root.tag == "{" + NAMESPACES["atom"] + "}feed":
@@ -103,6 +169,11 @@ async def feed(request: Request) -> Response:
 
     new_elements = []
     query = dict(parse_qsl(url.query))
+
+    # If the client provided an Authorization header or something then we
+    # should forward that for all sub-requests too. But we can't allow "not
+    # modified" or "partial content" responses: we need the entire thing.
+    remove_headers(request_headers, "if-none-match", "if-modified-since")
 
     if query.get(b"order") == b"ASC":
         # This is a legit archive page. We just need to construct an
@@ -126,7 +197,9 @@ async def feed(request: Request) -> Response:
         )
 
         if page > 1:
-            prev_url = await hash_page(url, raw_content_type, page - 1)
+            prev_url = await hash_page(
+                url, request_headers, actual_hash, raw_content_type, page - 1
+            )
             new_elements.append(
                 element(
                     "atom",
@@ -136,6 +209,33 @@ async def feed(request: Request) -> Response:
                     type=content_type,
                 )
             )
+
+        # Archive pages are indefinitely cachable because we'll point the
+        # client to a different URL if the contents should change.
+        response_headers["etag"] = ARCHIVE_ETAG
+        for header in ("last-modified", "expires"):
+            try:
+                del response_headers[header]
+            except KeyError:
+                pass
+
+        # This feed might still not be okay for a shared cache to store though;
+        # check for any existing Cache-Control directives.
+        cc = {
+            directive
+            for directive in get_list(response_headers.get("cache-control"))
+            if not directive.startswith("s-max-age=")
+            if not directive.startswith("max-age=")
+        }
+        if "private" not in cc:
+            cc.add("public")
+
+        # Cache this response for up to a year and don't revalidate it.
+        cc.discard("no-store")
+        cc.add('max-age="31536000"')
+        cc.add("immutable")
+
+        response_headers["cache-control"] = ", ".join(cc)
 
     elif b"order" in query or b"paged" in query:
         # Refuse to process non-archive feeds that don't have the newest entries.
@@ -147,7 +247,7 @@ async def feed(request: Request) -> Response:
         # into so we can link to the last of them.
         url = update_query(url, order="ASC")
         last_page = await exponential_search(
-            partial(page_exists, url, raw_content_type)
+            partial(page_exists, url, request_headers, raw_content_type)
         )
 
         if last_page == 1:
@@ -158,7 +258,9 @@ async def feed(request: Request) -> Response:
             # possibly a few extra if the number of posts per page doesn't
             # evenly divide into the total number of posts. Either way we
             # should link to the page before the final one.
-            prev_url = await hash_page(url, raw_content_type, last_page - 1)
+            prev_url = await hash_page(
+                url, request_headers, actual_hash, raw_content_type, last_page - 1
+            )
             new_elements.append(
                 element(
                     "atom",
@@ -172,14 +274,26 @@ async def feed(request: Request) -> Response:
     for e in reversed(new_elements):
         feed_element.insert(0, e)
 
-    return Response(ElementTree.tostring(root), media_type=content_type)
+    return Response(
+        ElementTree.tostring(root),
+        media_type=content_type,
+        headers=dict(response_headers.items()),
+    )
 
 
-async def hash_page(url: httpx.URL, content_type: str, page: int) -> httpx.URL:
+async def hash_page(
+    url: httpx.URL,
+    headers: httpx.Headers,
+    other_hash: bytes,
+    content_type: str,
+    page: int,
+) -> httpx.URL:
     if page != 1:
         url = update_query(url, paged=str(page))
 
-    async with http_client.stream("GET", url, allow_redirects=False) as doc:
+    async with http_client.stream(
+        "GET", url, allow_redirects=False, headers=headers
+    ) as doc:
         if doc.status_code != 200:
             raise HTTPException(502, f"Bad status {doc.status_code} for hashed page")
 
@@ -201,10 +315,20 @@ async def hash_page(url: httpx.URL, content_type: str, page: int) -> httpx.URL:
     # on this page. But if those haven't changed, it ought to be true that
     # nothing else in this page has changed either, so hashing the entire page
     # also works, and avoids spending time and memory on XML parsing.
-    return update_query(url, modified=urlsafe_b64encode(contents.digest()).decode())
+    this_hash = urlsafe_b64encode(contents.digest())
+
+    # If we query two different URLs and they return identical contents, the
+    # server must be ignoring the query-string parameters we changed. In that
+    # case, we can't extract history from this feed and must give up.
+    if this_hash == other_hash:
+        raise HTTPException(403, "Not a paginated WordPress feed")
+
+    return update_query(url, modified=this_hash.decode())
 
 
-async def page_exists(url: httpx.URL, content_type: str, page: int) -> bool:
+async def page_exists(
+    url: httpx.URL, headers: httpx.Headers, content_type: str, page: int
+) -> bool:
     """
     Tests whether the given URL exists and has the given Content-Type, if we
     request the specified page number out of its paginated sequence.
@@ -223,7 +347,7 @@ async def page_exists(url: httpx.URL, content_type: str, page: int) -> bool:
         return True
 
     url = update_query(url, paged=str(page))
-    response = await http_client.head(url, allow_redirects=False)
+    response = await http_client.head(url, allow_redirects=False, headers=headers)
     if response.status_code == 404:
         return False
     if response.status_code != 200:
@@ -265,6 +389,35 @@ def update_query(url: httpx.URL, **new_params: Optional[str]) -> httpx.URL:
             params[k.encode()] = v.encode()
     query = urlencode(sorted(params.items())).encode()
     return url.copy_with(query=query)
+
+
+def remove_headers(headers: httpx.Headers, *remove: str) -> None:
+    for header in remove:
+        try:
+            del headers[header]
+        except KeyError:
+            pass
+
+
+def remove_connection_headers(headers: httpx.Headers) -> None:
+    """
+    Removes the standard hop-by-hop headers, the `Connection` header and any
+    hop-by-hop headers it names, and anything else that would interfere with
+    our transformations.
+    """
+
+    remove_headers(
+        headers,
+        *CONNECTION_HEADERS.union(
+            header.lower() for header in get_list(headers.get("connection"))
+        ),
+    )
+
+
+def get_list(value: Optional[str]) -> Iterable[str]:
+    if value is not None:
+        return (item.strip() for item in value.split(","))
+    return ()
 
 
 def element(prefix: str, name: str, **kwargs: str) -> ElementTree.Element:
