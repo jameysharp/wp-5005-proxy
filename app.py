@@ -1,5 +1,4 @@
 from base64 import urlsafe_b64encode
-from defusedxml.ElementTree import XMLParser  # type: ignore
 from functools import partial
 from hashlib import sha256
 import httpx
@@ -9,9 +8,14 @@ from starlette.exceptions import HTTPException
 from starlette.responses import Response
 from starlette.requests import Request
 from starlette.routing import Route
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode
 from xml.etree import ElementTree
+
+if TYPE_CHECKING:
+    XMLParser = ElementTree.XMLParser
+else:
+    from defusedxml.ElementTree import XMLParser
 
 
 NAMESPACES = {
