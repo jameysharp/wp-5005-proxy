@@ -27,6 +27,7 @@ addopts = """\
   --doctest-modules \
   --cov-report html --cov-report term:skip-covered --no-cov-on-fail \
 """
+testpaths = "app.py"
 
 [tool.coverage.run]
 source = ["app.py"]
