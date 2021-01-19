@@ -30,7 +30,7 @@ addopts = """\
 testpaths = "app.py"
 
 [tool.coverage.run]
-source = ["app.py"]
+source = ["app"]
 
 [tool.coverage.report]
 skip_empty = true
