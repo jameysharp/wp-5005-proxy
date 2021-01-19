@@ -10,12 +10,13 @@ from starlette.requests import Request
 from starlette.routing import Route
 from typing import Awaitable, Callable, Iterable, Optional, TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode
-from xml.etree import ElementTree
 
 if TYPE_CHECKING:
-    XMLParser = ElementTree.XMLParser
+    from xml.etree import ElementTree
+    from xml.etree.ElementTree import XMLParser
 else:
     from defusedxml.ElementTree import XMLParser
+    from xml.etree import ElementTree
 
 
 NAMESPACES = {
@@ -63,6 +64,7 @@ CONNECTION_HEADERS = frozenset(
         # these could confuse us:
         "accept-encoding",
         "accept-ranges",
+        "content-length",
         "expect",
         "if-range",
         "range",
