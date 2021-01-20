@@ -64,6 +64,7 @@ CONNECTION_HEADERS = frozenset(
         # these could confuse us:
         "accept-encoding",
         "accept-ranges",
+        "content-encoding",
         "content-length",
         "expect",
         "host",
@@ -122,7 +123,7 @@ async def feed(request: Request) -> Response:
     remove_connection_headers(request_headers)
 
     async with http_client.stream("GET", url, headers=request_headers) as doc:
-        response_headers = doc.headers
+        response_headers = doc.headers.copy()
         remove_connection_headers(response_headers)
 
         assert doc.url is not None
