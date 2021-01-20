@@ -1,9 +1,12 @@
 [tool.poetry]
-name = "wp-5005-proxy"
+name = "wp5005"
 version = "0.1.0"
 description = "Synthesize an RFC5005 feed from a WordPress site"
 authors = ["Jamey Sharp <jamey@minilop.net>"]
 license = "AGPL-3.0-only"
+
+[tool.poetry.scripts]
+wp5005 = "wp5005.app:run"
 
 [tool.poetry.dependencies]
 python = "^3.7"
@@ -27,10 +30,10 @@ addopts = """\
   --doctest-modules \
   --cov-report html --cov-report term:skip-covered --no-cov-on-fail \
 """
-testpaths = "app.py"
+testpaths = "wp5005"
 
 [tool.coverage.run]
-source = ["app"]
+source = ["wp5005"]
 
 [tool.coverage.report]
 skip_empty = true
