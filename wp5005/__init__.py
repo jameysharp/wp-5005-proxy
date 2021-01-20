@@ -66,6 +66,7 @@ CONNECTION_HEADERS = frozenset(
         "accept-ranges",
         "content-length",
         "expect",
+        "host",
         "if-range",
         "range",
     )
