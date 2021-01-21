@@ -321,8 +321,7 @@ async def hash_page(
     content_type: str,
     page: int,
 ) -> httpx.URL:
-    if page != 1:
-        url = update_query(url, paged=str(page))
+    url = update_query(url, paged=None if page == 1 else str(page))
 
     async with http_client.stream(
         "GET", url, allow_redirects=False, headers=headers
