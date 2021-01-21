@@ -48,8 +48,31 @@ HISTORY_TAGS = (
 # URL, not its cache validators. So a hard-coded ETag is fine.
 ARCHIVE_ETAG = '"wp-rfc5005-archive"'
 
-# We remove these headers before forwarding the client's headers to the server
-# or vice-versa. See remove_connection_headers below.
+# WordPress sets ETag and Last-Modified based on the timestamp of the
+# most recently modified post anywhere on the site, and has done so
+# unchanged since at least 2010. This means that our transformed feed
+# won't have changed if the upstream validators haven't changed. So we
+# can safely forward cache validation headers between the client and
+# server. Other headers are useful for allowing the client to negotiate
+# details of what content it wants. But allowing arbitrary client
+# headers would mean we could be asking the server for some HTTP
+# extension that we don't actually understand.
+FORWARD_REQUEST_HEADERS = (
+    "Accept",
+    "Accept-Language",
+    "Authorization",
+    "Cache-Control",
+    "Cookie",
+    "DNT",
+    "From",
+    "If-Modified-Since",
+    "If-None-Match",
+    "User-Agent",
+)
+
+# We remove these headers before forwarding the response headers to the
+# client. Other headers are forwarded as-is and we hope they don't
+# change the interpretation of the response.
 CONNECTION_HEADERS = frozenset(
     (
         "connection",
@@ -61,15 +84,11 @@ CONNECTION_HEADERS = frozenset(
         "trailer",
         "transfer-encoding",
         "upgrade",
-        # these could confuse us:
-        "accept-encoding",
+        # these might not match the response we're sending and could
+        # confuse the client:
         "accept-ranges",
         "content-encoding",
         "content-length",
-        "expect",
-        "host",
-        "if-range",
-        "range",
     )
 )
 
@@ -113,18 +132,28 @@ async def feed(request: Request) -> Response:
     # the current feed must change whenever any post is modified.
     url = update_query(url, modified=None, orderby="modified")
 
-    # WordPress sets ETag and Last-Modified based on the timestamp of the most
-    # recently modified post anywhere on the site, and has done so unchanged
-    # since at least 2010. This means that our transformed feed won't have
-    # changed if the upstream validators haven't changed. So we can safely
-    # forward cache validation headers between the client and server.
-
-    request_headers = httpx.Headers(request.headers.items())
-    remove_connection_headers(request_headers)
+    # Forward a limited set of headers from the client request.
+    # Enumerating a complete block-list is too hard, so block anything
+    # that isn't specifically allowed.
+    request_headers = httpx.Headers()
+    for header in FORWARD_REQUEST_HEADERS:
+        value = request.headers.get(header)
+        if value is not None:
+            request_headers[header] = value
 
     async with http_client.stream("GET", url, headers=request_headers) as doc:
         response_headers = doc.headers.copy()
-        remove_connection_headers(response_headers)
+
+        # Remove the standard hop-by-hop headers, the `Connection`
+        # header and any hop-by-hop headers it names, and anything else
+        # that would interfere with our transformations.
+        remove_headers(
+            response_headers,
+            *CONNECTION_HEADERS.union(
+                header.lower()
+                for header in get_list(response_headers.get("connection"))
+            ),
+        )
 
         assert doc.url is not None
         url = doc.url
@@ -396,26 +425,21 @@ def update_query(url: httpx.URL, **new_params: Optional[str]) -> httpx.URL:
 
 
 def remove_headers(headers: httpx.Headers, *remove: str) -> None:
+    """
+    Remove the named headers in-place, ignoring any names that aren't
+    present.
+
+    >>> headers = httpx.Headers({"Foo": "bar", "Baz": "quux"})
+    >>> remove_headers(headers, "baz", "blah")
+    >>> headers
+    Headers({'foo': 'bar'})
+    """
+
     for header in remove:
         try:
             del headers[header]
         except KeyError:
             pass
-
-
-def remove_connection_headers(headers: httpx.Headers) -> None:
-    """
-    Removes the standard hop-by-hop headers, the `Connection` header and any
-    hop-by-hop headers it names, and anything else that would interfere with
-    our transformations.
-    """
-
-    remove_headers(
-        headers,
-        *CONNECTION_HEADERS.union(
-            header.lower() for header in get_list(headers.get("connection"))
-        ),
-    )
 
 
 def get_list(value: Optional[str]) -> Iterable[str]:
